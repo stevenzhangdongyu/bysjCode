@@ -1,52 +1,82 @@
 import random
+import sys
 import time
 import datetime
-from minio import Minio
+from minio import Minio, S3Error
 import cv2
 from urllib.parse import urlparse
 import os
+from PIL import Image
 import numpy as np
+import io
+import torchvision.transforms as transforms
 import torch
 import torchvision
 from flask import Flask, jsonify, render_template, send_file
 from flask_cors import CORS
 from torchvision.ops import batched_nms
-
+import json
+from flask import request
+import requests
+maxPage = 0
+bucket_name = "imagebucket"
+resultBucketName = "resultbucket"
+userBucketName = "user-images"
 app = Flask(__name__,template_folder='templates')
+CORS(app)
 client = Minio(
     "116.63.35.72:9000",
     access_key="cLuAvJjxwX7PJs7IUzRL",
     secret_key="80pT8fpk4DAtWqRSK4tEu5hyU5ho7EQQTAcpXag8",
     secure=False
 )
+
+IMAGES_PER_PAGE = 9
 IMAGES = [
 
 ]
-bucket_name = "imagebucket"
-objects = client.list_objects("imagebucket",prefix='test2017/')
-for obj in objects:
-    url = client.presigned_get_object(bucket_name,obj.object_name)
-    IMAGES.append(url)
+maxPage = 0
+
+
+
+# COCO classes
+CLASSES = [
+"road-signs","bus_stop","do_not_enter","do_not_stop","do_not_turn_l","do_not_turn_r","do_not_u_turn",
+"enter_left_lane","green_light","left_right_lane","no_parking","parking","ped_crossing",
+"ped_zebra_cross","railway_crossing","red_light","stop","t_intersection_l","traffic_light",
+"u_turn","warning","yellow_light",
+]
+model =torch.load('mobile_model.pt')
+model.eval()
+image_Totensor = torchvision.transforms.ToTensor()
+def fetchMinioImages():
+    global IMAGES
+    global maxPage
+    IMAGES = []
+    objects = client.list_objects("imagebucket", prefix='test2017/')
+    objs = []
+    for obj in objects:
+        objs.append(obj)
+    objs =  sorted(objs, key=lambda obj: obj.last_modified, reverse=True)
+    for obj in objs:
+        url = client.presigned_get_object(bucket_name, obj.object_name)
+        IMAGES.append(url)
+    maxPage = (len(IMAGES) - 1) // IMAGES_PER_PAGE
 def allow_cors(func):
     def wrapper(*args, **kwargs):
         response = func(*args, **kwargs)
         response.headers.add('Access-Control-Allow-Origin', '*')  # 允许所有域名访问，可自定义
         return response
     return wrapper
-CORS(app)
+
+
 
 def allow_cors(func):
     def wrapper(*args, **kwargs):
         response = func(*args, **kwargs)
         response.headers.add('Access-Control-Allow-Origin', '*')  # 允许所有域名访问，可自定义
         return response
-
     return wrapper
-import io
-
-import torchvision.transforms as transforms
-from PIL import Image
-resultBucketName = "resultbucket"
 def transform_image(image_bytes):
     my_transforms = transforms.Compose([transforms.Resize(255),
                                         transforms.CenterCrop(224),
@@ -56,12 +86,9 @@ def transform_image(image_bytes):
                                             [0.229, 0.224, 0.225])])
     image = Image.open(io.BytesIO(image_bytes))
     return my_transforms(image).unsqueeze(0)
-model =torch.load('mobile_model.pt')
-model.eval()
-image_Totensor = torchvision.transforms.ToTensor()
-import json
 
-imagenet_class_index = json.load(open('imagenet_class_index.json'))
+
+
 def rescale_bboxes(out_bbox, size):
     # 把比例坐标乘以图像的宽和高，变成真实坐标
     img_w, img_h = size
@@ -85,13 +112,7 @@ def filter_boxes(scores, boxes, confidence=0.7, apply_nms=True, iou=0.5):
         scores, boxes = scores[keep], boxes[keep]
 
     return scores, boxes
-# COCO classes
-CLASSES = [
-"road-signs","bus_stop","do_not_enter","do_not_stop","do_not_turn_l","do_not_turn_r","do_not_u_turn",
-"enter_left_lane","green_light","left_right_lane","no_parking","parking","ped_crossing",
-"ped_zebra_cross","railway_crossing","red_light","stop","t_intersection_l","traffic_light",
-"u_turn","warning","yellow_light",
-]
+
 def plot_one_box(x, img, color=None, label=None, line_thickness=1):
     # 把检测框画到图片上
     tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
@@ -119,7 +140,7 @@ def get_prediction(imgUrl,name):
     time1 = time.time()
     inference_result = model(image_tensor)
     time2 = time.time()
-    print("inference_time:", time2 - time1)
+    # print("inference_time:", time2 - time1)
     probas = inference_result['pred_logits'].softmax(-1)[0, :, :-1].cpu()
     bboxes_scaled = rescale_bboxes(inference_result['pred_boxes'][0,].cpu(),
                                    (image_tensor.shape[3], image_tensor.shape[2]))
@@ -148,9 +169,27 @@ def get_prediction(imgUrl,name):
         return  tempUrl
     else:
         return None
-from flask import request
 
-import requests
+
+def upload_file_to_minio(file_storage, bucket_name, object_name):
+    try:
+        # 确保存储桶存在
+        if not client.bucket_exists(bucket_name):
+            client.make_bucket(bucket_name)
+
+        file_stream = io.BytesIO()
+        file_data = file_storage.read()
+        image_stream = io.BytesIO(file_data)
+        image = Image.open(image_stream)
+        image = image.resize((640,640))
+        object_name = 'test2017/' + object_name
+        image.save(file_stream,format='jpeg')
+        file_stream.seek(0)
+        client.put_object(bucket_name,object_name,file_stream,length=file_stream.getbuffer().nbytes)
+        # print("文件上传成功")
+    except S3Error as exc:
+        # print("文件上传失败：", exc)
+        pass
 def getMinioPrediction(imgUrls):
     resUrls = []
     for imgUrl in imgUrls:
@@ -159,8 +198,9 @@ def getMinioPrediction(imgUrls):
         if response.status_code == 200:
             fileBack =  get_prediction(response.content,name)
             resUrls.append(fileBack)
-            print(fileBack)
+            # print(fileBack)
     return resUrls
+@allow_cors
 @app.route('/predict',methods = ['POST'])
 def predict():
     data = request.get_json()
@@ -168,18 +208,35 @@ def predict():
     res = getMinioPrediction(images)
     return jsonify({"status":"ok", "code" : 200,"data":res})
 
-IMAGES_PER_PAGE = 10
+@allow_cors
 @app.route('/get_images/<int:page>', methods=['GET'])
 def get_images(page):
     start = page * IMAGES_PER_PAGE
+    if start < 0:
+        return jsonify({"status": "no"}), 404
     end = start + IMAGES_PER_PAGE
+    if end > len(IMAGES):
+        end = len(IMAGES)
     images = IMAGES[start:end]
-    # 如果请求的页码超出范围，则返回空列表
     if not images:
-        return jsonify({"error": "Page out of range"}), 404
+        return jsonify({"status":"no"}), 404
+    return jsonify({"images": images,"status":"yes","maxPage": maxPage})
+@app.route('/hello',methods = ['GET'])
+def hello():
+    return 'hello response'
 
-    return jsonify({"images": images})
-
+@app.route('/refresh',methods = ['GET'])
+def refresh():
+    fetchMinioImages()
+    return jsonify({"status":"yes"})
+@app.route('/upload_images',methods= ['POST'])
+def uploadImages():
+    if 'files[]' not in request.files:
+        return jsonify({'error': 'No files part in the request'}), 400
+    files = request.files.getlist('files[]')
+    for file in files:
+        upload_file_to_minio(file,bucket_name,file.filename)
+    fetchMinioImages()
+    return jsonify({"status":"yes","maxPage":maxPage})
 if __name__ == '__main__':
-    app.run()
-
+    app.run(host='0.0.0.0',port=5000)

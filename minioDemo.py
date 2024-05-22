@@ -2,6 +2,14 @@
 from minio import Minio
 from minio.error import S3Error
 import urllib3
+from functools import cmp_to_key
+def myComparator(x,y):
+    if x.last_modified < y.last_modified:
+        return -1
+    elif x.last_modified == y.last_modified:
+        return 0
+    else:
+        return 1
 def main():
     # Create a client with the MinIO server playground, its access key
     # and secret key.
@@ -13,11 +21,19 @@ def main():
         secure=False
     )
     bucket_name = "imagebucket"
-    print(client.list_buckets())
-    objects = client.list_objects("imagebucket",prefix='test2017/')
+    IMAGES = []
+    IMAGES_PER_PAGE = 9
+    objects = client.list_objects(bucket_name,prefix='test2017/')
+    objs = []
     for obj in objects:
-        url = client.presigned_get_object(bucket_name,obj.object_name)
-        print(url)
+        a = obj.last_modified
+        objs.append(obj)
+    objs = sorted(objs, key=cmp_to_key(mycmp=myComparator))
+    for obj in objs:
+        url = client.presigned_get_object(bucket_name, obj.object_name)
+        IMAGES.append(url)
+
+    maxPage = (len(IMAGES) - 1) // IMAGES_PER_PAGE
     # # The file to upload, change this path if needed
     # source_file = "/tmp/test-steven-file.txt"
     #
